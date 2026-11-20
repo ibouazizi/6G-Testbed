@@ -501,6 +501,7 @@ class TestbedOrchestrator:
         finally:
             # Clear network profile
             self.emulator.clear()
+            self._clear_scenario_loopback()
 
         # stop-on-error: only raise if every run failed on a baseline profile
         # (no_emulation), indicating a real infrastructure problem. Failures on
@@ -542,6 +543,19 @@ class TestbedOrchestrator:
             except Exception:  # noqa: BLE001, torch built without CUDA support
                 pass
         return None
+
+    def _clear_scenario_loopback(self) -> None:
+        """Remove loopback netem left by scenarios (MCP/gateway shaping).
+
+        Skipped when the experiment itself shapes ``lo``: that qdisc is the
+        active profile and is removed by ``self.emulator.clear()`` instead.
+        """
+        if getattr(self.emulator, "interface", None) == "lo":
+            return
+        try:
+            self.emulator.clear_loopback()
+        except Exception as exc:  # noqa: BLE001, best-effort cleanup
+            logger.warning(f"Failed to clear loopback shaping: {exc}")
 
     def _run_with_timeout(
         self,
@@ -598,32 +612,50 @@ class TestbedOrchestrator:
             name=f"scenario-{scenario_name}-run{run_index}",
             daemon=False,
         )
+        def _kill_worker_group():
+            """SIGTERM the worker's process group, escalating to SIGKILL."""
+            for sig, fallback in ((signal.SIGTERM, worker.terminate),
+                                  (signal.SIGKILL, worker.kill)):
+                if not worker.is_alive():
+                    return
+                try:
+                    if os.getpgid(worker.pid) == worker.pid:
+                        os.killpg(worker.pid, sig)
+                    else:
+                        fallback()
+                except (ProcessLookupError, OSError):
+                    fallback()
+                worker.join(timeout=5)
+
         worker.start()
         send_conn.close()
 
-        if not recv_conn.poll(timeout_sec):
+        # The worker runs in its own session (setsid), so a terminal Ctrl+C
+        # never reaches it. Kill it explicitly if the parent is interrupted,
+        # otherwise it keeps issuing paid API calls and multiprocessing's
+        # atexit join blocks until the scenario finishes on its own.
+        try:
+            ready = recv_conn.poll(timeout_sec)
+            if ready:
+                try:
+                    kind, payload = recv_conn.recv()
+                except EOFError:
+                    kind, payload = None, None
+        except BaseException:
+            _kill_worker_group()
+            recv_conn.close()
+            raise
+
+        if not ready:
             logger.warning(
                 f"  Run {run_index + 1} of {scenario_name} timed out "
                 f"after {timeout_sec:.0f}s; terminating worker process group"
             )
-            try:
-                if os.getpgid(worker.pid) == worker.pid:
-                    os.killpg(worker.pid, signal.SIGTERM)
-                else:
-                    worker.terminate()
-            except (ProcessLookupError, OSError):
-                worker.terminate()
-            worker.join(timeout=5)
-            if worker.is_alive():
-                try:
-                    if os.getpgid(worker.pid) == worker.pid:
-                        os.killpg(worker.pid, signal.SIGKILL)
-                    else:
-                        worker.kill()
-                except (ProcessLookupError, OSError):
-                    worker.kill()
-                worker.join(timeout=5)
+            _kill_worker_group()
             recv_conn.close()
+            # The killed worker never ran its teardown, so loopback shaping
+            # applied by agent/openclaw/a2a/realtime scenarios would linger.
+            self._clear_scenario_loopback()
             return ScenarioResult(
                 scenario_id=scenario_name,
                 session_id=f"timeout_{int(time.time())}",
@@ -633,15 +665,12 @@ class TestbedOrchestrator:
                 total_latency_sec=timeout_sec,
                 error_message=f"Run timed out after {timeout_sec:.0f}s")
 
-        try:
-            kind, payload = recv_conn.recv()
-        except EOFError as exc:
+        recv_conn.close()
+        if kind is None:
             worker.join(timeout=5)
             raise RuntimeError(
                 f"Scenario worker exited with code {worker.exitcode} without a result"
-            ) from exc
-        finally:
-            recv_conn.close()
+            )
         worker.join(timeout=5)
         if kind == "err":
             raise RuntimeError(
